@@ -516,7 +516,7 @@ def add_to_queue():
     last = LAST_REQUESTS.get(requester_id)
     if last is not None:
         elapsed = time.time() - last
-        if elapsed < RATE_LIMIT_SECONDS:
+        if elapsed < RATE_LIMIT_SECONDS and requester_id != STREAMER_ID:
             retry_after = int(RATE_LIMIT_SECONDS - elapsed)
             resp = jsonify({"error": "rate_limited", "retry_after": retry_after})
             resp.status_code = 429
