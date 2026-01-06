@@ -1,0 +1,220 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>Spotify Twitch</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+
+<body>
+    <div class="container">
+        <div class="header-row">
+            <h1>Spotify Twitch</h1>
+        </div>
+        {% if twitch_user %}
+        <p>Signed in as {{ twitch_user.display_name }} (Twitch ID: {{ twitch_user.id }})</p>
+        {# Streamer claim/unclaim controls #}
+        {% if not streamer_id %}
+        <form action="/set_streamer" method="post">
+            <button type="submit">Set me as Streamer</button>
+        </form>
+        {% elif streamer_id == twitch_user.id %}
+        <p><strong>You are the streamer.</strong></p>
+        <form action="/unset_streamer" method="post">
+            <button type="submit">Unset streamer</button>
+        </form>
+        {% else %}
+        <p></p>
+        {% endif %}
+
+        {# Spotify link status: only streamer may link #}
+        {% if spotify_linked %}
+        <p>Spotify: linked</p>
+        {% else %}
+        {% if streamer_id and twitch_user.id == streamer_id %}
+        <p>Spotify: not linked</p>
+        <a href="{{ spotify_auth_url }}">Link Spotify</a>
+        {% else %}
+        <p></p>
+        {% endif %}
+        {% endif %}
+
+        <hr>
+        <!-- Search and add via streamer's Spotify account -->
+        <div id="search">
+            <h2>Search tracks</h2>
+            <form id="searchForm">
+                <input id="q" name="q" placeholder="search for a track or artist" required>
+                <button type="submit">Search</button>
+            </form>
+            <button id="hideResults">Hide Results</button>
+            <ul id="results"></ul>
+        </div>
+
+        <hr>
+        <div id="queue">
+            <h2>Queue</h2>
+            <ul id="queueList"></ul>
+        </div>
+        <p><a href="/login/twitch">Relogin Twitch</a></p>
+    </div>
+    <!-- Error Modal -->
+    <div id="errorModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <p id="errorMessage"></p>
+        </div>
+    </div>
+    {% else %}
+    <p><a href="{{ twitch_auth_url }}">Sign in with Twitch</a></p>
+    {% endif %}
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js"></script>
+    <script>
+        async function search(q) {
+            const res = await fetch('/search?q=' + encodeURIComponent(q));
+            if (!res.ok) {
+                const js = await res.json();
+                let message = 'Search failed: ' + js.error;
+                document.getElementById('errorMessage').textContent = message;
+                document.getElementById('errorModal').style.display = 'block';
+                return;
+            }
+            const js = await res.json();
+            const ul = document.getElementById('results');
+            ul.innerHTML = '';
+            for (const t of js.tracks || []) {
+                const li = document.createElement('li');
+                const meta = document.createElement('div');
+                meta.className = 'track-meta';
+                const title = document.createElement('div');
+                title.textContent = t.name;
+                const artists = document.createElement('small');
+                artists.textContent = t.artists.join(', ');
+                meta.appendChild(title);
+                meta.appendChild(artists);
+
+                const btn = document.createElement('button');
+                btn.textContent = 'Add';
+                btn.onclick = async () => {
+                    const r = await fetch('/add', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ track_uri: t.uri })
+                    });
+                    if (r.ok) {
+                        console.log('Add successful');
+                        // success — UI will be updated from socket event
+                    } else {
+                        const js = await r.json();
+                        let message = 'Add failed: ' + js.error;
+                        if (js.error === 'rate_limited') {
+                            const minutes = Math.floor(js.retry_after / 60);
+                            const seconds = js.retry_after % 60;
+                            message += ` Retry after ${minutes}m ${seconds}s`;
+                        }
+                        document.getElementById('errorMessage').textContent = message;
+                        document.getElementById('errorModal').style.display = 'block';
+                    }
+                };
+                li.appendChild(meta);
+                li.appendChild(btn);
+                ul.appendChild(li);
+            }
+        }
+        document.getElementById('searchForm').addEventListener('submit', e => {
+            e.preventDefault();
+            const q = document.getElementById('q').value;
+            search(q);
+        });
+
+        document.getElementById('hideResults').addEventListener('click', () => {
+            document.getElementById('results').innerHTML = '';
+        });
+
+        async function loadQueue() {
+            const res = await fetch('/spotify_queue');
+            if (!res.ok) return;
+            const js = await res.json();
+            const ul = document.getElementById('queueList');
+            ul.innerHTML = '';
+            const lis = [];
+            let hasAdded = false;
+            let lastAddedIndex = -1;
+            for (let i = 0; i < (js.queue || []).length; i++) {
+                const e = js.queue[i];
+                const who = e.added_by ? (e.added_by.display_name || e.added_by.id) : null;
+                const li = document.createElement('li');
+                const title = e.track ? e.track.name : e.track.uri;
+                const artists = e.track ? e.track.artists.join(', ') : '';
+                li.innerHTML = `<div class="track-meta"><div>${title}</div><small>${artists}</small></div>${who ? `<div class="notice">Added by ${who}</div>` : ''}`;
+                lis.push(li);
+                if (who) {
+                    hasAdded = true;
+                    lastAddedIndex = i;
+                }
+            }
+            // insert separator after last added, if there are added and non-added after
+            if (hasAdded && lastAddedIndex < lis.length - 1) {
+                const sep = document.createElement('li');
+                sep.className = 'queue-separator';
+                sep.textContent = '--- Already in Queue ---';
+                lis.splice(lastAddedIndex + 1, 0, sep);
+            }
+            lis.forEach(li => ul.appendChild(li));
+        }
+        // initial load
+        loadQueue();
+
+        // setup socket.io for realtime updates
+        const socket = io({ transports: ['websocket', 'polling'] });
+        socket.on('connect', () => { console.log('socket connected, transport:', socket.io.engine.transport.name); });
+        socket.on('disconnect', () => { console.log('socket disconnected'); });
+        socket.on('queue_updated', data => { console.log('queue_updated received', data); if (data && data.queue) updateQueueUI(data.queue); });
+        socket.on('streamer_changed', data => { console.log('streamer_changed received', data); location.reload(); });
+
+        function updateQueueUI(queue) {
+            console.log('Updating queue UI with', queue ? queue.length : 0, 'items');
+            const ul = document.getElementById('queueList');
+            ul.innerHTML = '';
+            const lis = [];
+            let hasAdded = false;
+            let lastAddedIndex = -1;
+            for (let i = 0; i < (queue || []).length; i++) {
+                const e = queue[i];
+                const who = e.added_by ? (e.added_by.display_name || e.added_by.id) : null;
+                const li = document.createElement('li');
+                const title = e.track ? e.track.name : e.track.uri;
+                const artists = e.track ? e.track.artists.join(', ') : '';
+                li.innerHTML = `<div class="track-meta"><div>${title}</div><small>${artists}</small></div>${who ? `<div class="notice">Added by ${who}</div>` : ''}`;
+                lis.push(li);
+                if (who) {
+                    hasAdded = true;
+                    lastAddedIndex = i;
+                }
+            }
+            // insert separator after last added, if there are added and non-added after
+            if (hasAdded && lastAddedIndex < lis.length - 1) {
+                const sep = document.createElement('li');
+                sep.className = 'queue-separator';
+                sep.textContent = '--- Already in Queue ---';
+                lis.splice(lastAddedIndex + 1, 0, sep);
+            }
+            lis.forEach(li => ul.appendChild(li));
+        }
+
+        // Modal close functionality
+        document.getElementsByClassName('close')[0].onclick = function () {
+            document.getElementById('errorModal').style.display = 'none';
+        }
+
+        window.onclick = function (event) {
+            if (event.target == document.getElementById('errorModal')) {
+                document.getElementById('errorModal').style.display = 'none';
+            }
+        }
+
+    </script>
+</body>
+
+</html>
